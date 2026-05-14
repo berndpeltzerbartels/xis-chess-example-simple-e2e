@@ -1,0 +1,135 @@
+plugins {
+    id 'java'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.10.3')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation 'com.microsoft.playwright:playwright:1.52.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+ext.chessAppProcess = null
+
+def configuredBaseUrl = {
+    (findProperty('baseUrl') ?: System.getenv('BASE_URL') ?: 'http://localhost:8080').toString().replaceAll('/+$', '')
+}
+
+def configuredChessAppDir = {
+    if (findProperty('chessAppDir') != null) {
+        return file(findProperty('chessAppDir'))
+    }
+    def sibling = file('../xis-chess-example-simple')
+    if (sibling.isDirectory()) {
+        return sibling
+    }
+    file('/Users/bernd/projects/xis-chess-example-simple')
+}
+
+test {
+    useJUnitPlatform()
+
+    dependsOn 'startChessApp'
+    finalizedBy 'stopChessApp'
+
+    systemProperty 'baseUrl', configuredBaseUrl()
+    systemProperty 'headless', findProperty('headless') ?: System.getenv('HEADLESS') ?: 'true'
+
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
+}
+
+tasks.register('startChessApp') {
+    group = 'verification'
+    description = "Starts ../xis-chess-example-simple with xisRun unless baseUrl is already reachable."
+
+    doLast {
+        def baseUrl = configuredBaseUrl()
+        if (isReachable("${baseUrl}/game.html")) {
+            logger.lifecycle("Chess app already reachable at ${baseUrl}; not starting sibling project.")
+            return
+        }
+
+        def appDir = configuredChessAppDir()
+        if (!appDir.isDirectory()) {
+            throw new GradleException("Chess example not found at ${appDir}. Keep this E2E project next to xis-chess-example-simple or set -PchessAppDir=/path/to/xis-chess-example-simple.")
+        }
+
+        def gradlew = new File(appDir, isWindows() ? 'gradlew.bat' : 'gradlew')
+        if (!gradlew.isFile()) {
+            throw new GradleException("Gradle wrapper not found: ${gradlew}")
+        }
+
+        def logFile = file("$buildDir/chess-app.log")
+        logFile.parentFile.mkdirs()
+        logger.lifecycle("Starting chess app from ${appDir}; log: ${logFile}")
+        chessAppProcess = new ProcessBuilder(gradlew.absolutePath, 'xisRun')
+                .directory(appDir)
+                .redirectErrorStream(true)
+                .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
+                .start()
+
+        waitUntilReachable("${baseUrl}/game.html", 90_000)
+    }
+}
+
+tasks.register('stopChessApp') {
+    group = 'verification'
+    description = 'Stops the chess app process started by startChessApp.'
+
+    doLast {
+        if (chessAppProcess != null && chessAppProcess.isAlive()) {
+            logger.lifecycle('Stopping chess app.')
+            chessAppProcess.destroy()
+            if (!chessAppProcess.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                chessAppProcess.destroyForcibly()
+            }
+        }
+    }
+}
+
+tasks.register('playwrightInstall', JavaExec) {
+    group = 'verification'
+    description = 'Installs Playwright browser binaries for Java tests.'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.microsoft.playwright.CLI'
+    args 'install', 'chromium'
+}
+
+boolean isWindows() {
+    System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')
+}
+
+boolean isReachable(String url) {
+    try {
+        def connection = new URL(url).openConnection()
+        connection.connectTimeout = 1000
+        connection.readTimeout = 1000
+        connection.requestMethod = 'GET'
+        return connection.responseCode >= 200 && connection.responseCode < 500
+    } catch (Exception ignored) {
+        return false
+    }
+}
+
+void waitUntilReachable(String url, long timeoutMillis) {
+    long deadline = System.currentTimeMillis() + timeoutMillis
+    while (System.currentTimeMillis() < deadline) {
+        if (chessAppProcess != null && !chessAppProcess.isAlive()) {
+            throw new GradleException("Chess app process ended before ${url} became reachable. See build/chess-app.log.")
+        }
+        if (isReachable(url)) {
+            logger.lifecycle("Chess app reachable at ${url}")
+            return
+        }
+        Thread.sleep(1000)
+    }
+    throw new GradleException("Timed out waiting for chess app at ${url}. See build/chess-app.log.")
+}
